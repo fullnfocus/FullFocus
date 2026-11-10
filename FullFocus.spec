@@ -1,11 +1,15 @@
 # -*- mode: python ; coding: utf-8 -*-
+# build: pyinstaller FullFocus.spec
+import os
+
+ICON = os.path.join(SPECPATH, 'icon.ico')
 
 
 a = Analysis(
     ['full_focus.py'],
     pathex=[],
     binaries=[],
-    datas=[],
+    datas=[(ICON, '.')],  # so the tray icon works from the single .exe
     hiddenimports=[],
     hookspath=[],
     hooksconfig={},
@@ -35,5 +39,5 @@ exe = EXE(
     target_arch=None,
     codesign_identity=None,
     entitlements_file=None,
-    icon=['C:\\FullFocus\\assets\\icon.ico'],
+    icon=[ICON],
 )

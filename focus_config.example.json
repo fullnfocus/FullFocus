@@ -1,0 +1,30 @@
+{
+    "global": {
+        "check_interval_seconds": 3,
+        "notifications": true
+    },
+    "apps": [
+        {
+            "name": "steam.exe",
+            "enabled": true,
+            "mode": "constant"
+        },
+        {
+            "name": "discord.exe",
+            "enabled": true,
+            "mode": "scheduled",
+            "rules": [
+                {
+                    "days": ["mon", "tue", "wed", "thu", "fri"],
+                    "start": "18:00",
+                    "end": "23:00"
+                },
+                {
+                    "days": ["sat", "sun"],
+                    "start": "10:00",
+                    "end": "02:00"
+                }
+            ]
+        }
+    ]
+}

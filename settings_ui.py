@@ -1,124 +1,40 @@
-import json
-from pathlib import Path
-import tkinter as tk
+import psutil
 import sys
+import tkinter as tk
 import winreg
 from pathlib import Path
 from tkinter import ttk, messagebox
 
-def get_app_dir():
-    if getattr(sys, "frozen", False):
-        # Running as PyInstaller .exe
-        return Path(sys.executable).resolve().parent
-
-    # Running as normal .py file
-    return Path(__file__).resolve().parent
-
+from focus_core import (
+    clean_process_names,
+    get_app_dir,
+    is_protected_process,
+    parse_rules_text,
+    read_config_file,
+    rules_to_text,
+    write_config_file,
+)
 
 APP_DIR = get_app_dir()
 CONFIG_PATH = APP_DIR / "focus_config.json"
 
-VALID_DAYS = {"mon", "tue", "wed", "thu", "fri", "sat", "sun"}
 APP_NAME = "FullFocus"
 
 
 def load_config():
-    if not CONFIG_PATH.exists():
-        return {
-            "global": {
-                "check_interval_seconds": 3
-            },
-            "apps": []
-        }
-
-    with open(CONFIG_PATH, "r", encoding="utf-8") as f:
-        return json.load(f)
+    return read_config_file(CONFIG_PATH)
 
 
 def save_config(config):
-    with open(CONFIG_PATH, "w", encoding="utf-8") as f:
-        json.dump(config, f, indent=4)
-
-
-def validate_time(value):
-    try:
-        hour, minute = value.split(":")
-        hour = int(hour)
-        minute = int(minute)
-
-        return 0 <= hour <= 23 and 0 <= minute <= 59
-
-    except Exception:
-        return False
-
-
-def parse_rules_text(text):
-    """
-    Expected format, one rule per line:
-
-    tue 19:00 00:00
-    wed 00:00 07:00
-    mon,tue,wed 18:00 22:00
-    """
-    rules = []
-
-    lines = text.strip().splitlines()
-
-    for line in lines:
-        line = line.strip()
-
-        if not line:
-            continue
-
-        parts = line.split()
-
-        if len(parts) != 3:
-            raise ValueError(
-                f"Invalid rule: {line}\n\n"
-                "Use format: tue 19:00 00:00"
-            )
-
-        days_part, start, end = parts
-
-        days = [day.strip().lower() for day in days_part.split(",")]
-
-        for day in days:
-            if day not in VALID_DAYS:
-                raise ValueError(f"Invalid day: {day}")
-
-        if not validate_time(start):
-            raise ValueError(f"Invalid start time: {start}")
-
-        if not validate_time(end):
-            raise ValueError(f"Invalid end time: {end}")
-
-        rules.append({
-            "days": days,
-            "start": start,
-            "end": end
-        })
-
-    return rules
-
-
-def rules_to_text(rules):
-    lines = []
-
-    for rule in rules:
-        days = ",".join(rule.get("days", []))
-        start = rule.get("start", "00:00")
-        end = rule.get("end", "00:00")
-
-        lines.append(f"{days} {start} {end}")
-
-    return "\n".join(lines)
+    write_config_file(CONFIG_PATH, config)
 
 
 class SettingsApp:
     def __init__(self, root):
         self.root = root
         self.root.title("Full Focus Settings")
-        self.root.geometry("700x450")
+        self.root.geometry("820x600")
+        self.root.minsize(760, 560)
 
         self.config = load_config()
 
@@ -137,27 +53,52 @@ class SettingsApp:
 
         ttk.Label(left, text="Apps").pack(anchor="w")
 
-        self.app_listbox = tk.Listbox(left, height=20)
+        self.app_listbox = tk.Listbox(left, height=20, width=34)
         self.app_listbox.pack(fill="both", expand=True)
         self.app_listbox.bind("<<ListboxSelect>>", self.on_app_select)
 
         ttk.Button(left, text="Delete selected app", command=self.delete_selected_app).pack(fill="x", pady=(10, 0))
 
-        ttk.Label(right, text="App name / process name").pack(anchor="w")
-        self.name_entry = ttk.Entry(right)
-        self.name_entry.pack(fill="x", pady=(0, 10))
-
-        self.enabled_var = tk.BooleanVar(value=True)
-        ttk.Checkbutton(right, text="Enabled", variable=self.enabled_var).pack(anchor="w", pady=(0, 10))
+        # settings for the whole app, not one blocked app
+        general = ttk.LabelFrame(left, text="General", padding=8)
+        general.pack(fill="x", pady=(10, 0))
 
         self.startup_var = tk.BooleanVar(value=is_startup_enabled())
 
         ttk.Checkbutton(
-            right,
+            general,
             text="Launch Full Focus on Windows startup",
             variable=self.startup_var,
             command=self.toggle_startup
-        ).pack(anchor="w", pady=(0, 10))
+        ).pack(anchor="w")
+
+        self.notify_var = tk.BooleanVar(
+            value=self.config.get("global", {}).get("notifications", True)
+        )
+
+        ttk.Checkbutton(
+            general,
+            text="Show a notification when an app is blocked",
+            variable=self.notify_var,
+            command=self.toggle_notifications
+        ).pack(anchor="w", pady=(4, 0))
+
+        ttk.Label(right, text="App name / process name").pack(anchor="w")
+
+        name_row = ttk.Frame(right)
+        name_row.pack(fill="x", pady=(0, 10))
+
+        self.name_entry = ttk.Entry(name_row)
+        self.name_entry.pack(side="left", fill="x", expand=True)
+
+        ttk.Button(
+            name_row,
+            text="Pick from running apps...",
+            command=self.pick_running_app
+        ).pack(side="left", padx=(6, 0))
+
+        self.enabled_var = tk.BooleanVar(value=True)
+        ttk.Checkbutton(right, text="Enabled", variable=self.enabled_var).pack(anchor="w", pady=(0, 10))
 
         ttk.Label(right, text="Mode").pack(anchor="w")
         self.mode_var = tk.StringVar(value="constant")
@@ -175,7 +116,7 @@ class SettingsApp:
             text="Allowed windows for scheduled apps\nFormat: day start end\nExample: tue 19:00 00:00"
         ).pack(anchor="w")
 
-        self.rules_text = tk.Text(right, height=8)
+        self.rules_text = tk.Text(right, height=7)
         self.rules_text.pack(fill="both", expand=True, pady=(0, 10))
 
         ttk.Button(right, text="Add / Update app", command=self.save_app).pack(fill="x")
@@ -188,6 +129,8 @@ class SettingsApp:
 
         ttk.Label(right, text=help_text).pack(anchor="w", pady=(10, 0))
 
+        self.on_mode_change()
+
     def toggle_startup(self):
         try:
             set_startup_enabled(self.startup_var.get())
@@ -199,6 +142,19 @@ class SettingsApp:
 
         except Exception as e:
             messagebox.showerror("Startup error", str(e))
+
+    def toggle_notifications(self):
+        # the tray app rereads the config every scan, so this applies right away
+        self.config.setdefault("global", {})["notifications"] = self.notify_var.get()
+        save_config(self.config)
+
+    def pick_running_app(self):
+        picker = ProcessPicker(self.root)
+        self.root.wait_window(picker)
+
+        if picker.result:
+            self.name_entry.delete(0, tk.END)
+            self.name_entry.insert(0, picker.result)
 
     def refresh_app_list(self):
         self.app_listbox.delete(0, tk.END)
@@ -234,6 +190,8 @@ class SettingsApp:
         self.enabled_var.set(app.get("enabled", True))
         self.mode_var.set(app.get("mode", "constant"))
 
+        # disabled text widgets ignore edits
+        self.rules_text.configure(state="normal")
         self.rules_text.delete("1.0", tk.END)
         self.rules_text.insert("1.0", rules_to_text(app.get("rules", [])))
 
@@ -242,16 +200,25 @@ class SettingsApp:
     def on_mode_change(self, event=None):
         mode = self.mode_var.get()
 
+        # grey it out so it's obvious the rules don't apply in constant mode
         if mode == "constant":
-            self.rules_text.configure(state="disabled")
+            self.rules_text.configure(state="disabled", background="#f0f0f0", foreground="#888888")
         else:
-            self.rules_text.configure(state="normal")
+            self.rules_text.configure(state="normal", background="white", foreground="black")
 
     def save_app(self):
         name = self.name_entry.get().strip()
 
         if not name:
             messagebox.showerror("Error", "App name cannot be empty.")
+            return
+
+        if is_protected_process(name):
+            messagebox.showerror(
+                "Can't block this",
+                f"{name} is part of Windows or Full Focus itself. "
+                "Closing it could freeze or crash your PC."
+            )
             return
 
         if not name.lower().endswith(".exe"):
@@ -326,13 +293,89 @@ class SettingsApp:
 
         messagebox.showinfo("Deleted", "App deleted successfully.")
 
-def get_exe_path_for_startup():
-    if getattr(sys, "frozen", False):
-        return str(Path(sys.executable).resolve())
+class ProcessPicker(tk.Toplevel):
+    # searchable list of what's running right now, so you don't have to type exe names
 
-    # Dev mode fallback.
-    # Autostart is mainly meant for packaged .exe mode.
-    return str(Path(sys.executable).resolve())
+    def __init__(self, parent):
+        super().__init__(parent)
+        self.title("Pick a running app")
+        self.geometry("360x440")
+        self.transient(parent)
+
+        # keeps clicks on the settings window blocked until this one closes
+        self.wait_visibility()
+        self.grab_set()
+
+        self.result = None
+        self.all_names = clean_process_names(
+            proc.info["name"] for proc in psutil.process_iter(["name"])
+        )
+
+        frame = ttk.Frame(self, padding=10)
+        frame.pack(fill="both", expand=True)
+
+        ttk.Label(frame, text="Search").pack(anchor="w")
+
+        self.search_var = tk.StringVar()
+        self.search_var.trace_add("write", lambda *args: self.refresh())
+
+        search = ttk.Entry(frame, textvariable=self.search_var)
+        search.pack(fill="x", pady=(0, 8))
+        search.focus_set()
+
+        self.listbox = tk.Listbox(frame)
+        self.listbox.pack(fill="both", expand=True)
+        self.listbox.bind("<Double-Button-1>", lambda event: self.choose())
+        self.listbox.bind("<Return>", lambda event: self.choose())
+
+        buttons = ttk.Frame(frame)
+        buttons.pack(fill="x", pady=(8, 0))
+
+        ttk.Button(buttons, text="Cancel", command=self.destroy).pack(side="right")
+        ttk.Button(buttons, text="Use this app", command=self.choose).pack(side="right", padx=(0, 6))
+
+        # enter in the search box picks the first match
+        search.bind("<Return>", lambda event: self.choose(first_if_none=True))
+        self.bind("<Escape>", lambda event: self.destroy())
+
+        self.refresh()
+
+    def refresh(self):
+        query = self.search_var.get().lower().strip()
+
+        self.listbox.delete(0, tk.END)
+
+        for name in self.all_names:
+            if query in name.lower():
+                self.listbox.insert(tk.END, name)
+
+    def choose(self, first_if_none=False):
+        selection = self.listbox.curselection()
+
+        if selection:
+            self.result = self.listbox.get(selection[0])
+        elif first_if_none and self.listbox.size() > 0:
+            self.result = self.listbox.get(0)
+        else:
+            return
+
+        self.destroy()
+
+
+def get_startup_command():
+    # what goes in the windows Run key
+    if getattr(sys, "frozen", False):
+        return f'"{Path(sys.executable).resolve()}"'
+
+    # dev mode, pythonw so there's no console window
+    python = Path(sys.executable).resolve()
+    pythonw = python.with_name("pythonw.exe")
+
+    if pythonw.exists():
+        python = pythonw
+
+    script = APP_DIR / "full_focus.py"
+    return f'"{python}" "{script}"'
 
 
 def is_startup_enabled():
@@ -344,7 +387,7 @@ def is_startup_enabled():
             winreg.KEY_READ
         ) as key:
             value, _ = winreg.QueryValueEx(key, APP_NAME)
-            return value == f'"{get_exe_path_for_startup()}"'
+            return value == get_startup_command()
 
     except FileNotFoundError:
         return False
@@ -358,13 +401,12 @@ def set_startup_enabled(enabled):
         winreg.KEY_SET_VALUE
     ) as key:
         if enabled:
-            exe_path = get_exe_path_for_startup()
             winreg.SetValueEx(
                 key,
                 APP_NAME,
                 0,
                 winreg.REG_SZ,
-                f'"{exe_path}"'
+                get_startup_command()
             )
         else:
             try:
@@ -383,4 +425,4 @@ if __name__ == "__main__":
 
     root.protocol("WM_DELETE_WINDOW", on_close)
 
-    root.mainloop()
+    root.mainloop()

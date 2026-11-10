@@ -1,0 +1,23 @@
+# build output, the .exe goes in releases
+build/
+dist/
+
+# personal config, gets created on first run
+focus_config.json
+
+# log files, created next to the app
+*.log
+*.log.*
+
+# python
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.venv/
+venv/
+
+# editors / os
+.vscode/
+.idea/
+Thumbs.db
+desktop.ini

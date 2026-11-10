@@ -1,26 +1,30 @@
+import logging
+import os
 import psutil
 import threading
 import pystray
-import traceback
-import json
 import subprocess
 import sys
 import socket
-from PIL import Image, ImageDraw
+from logging.handlers import RotatingFileHandler
+from PIL import Image
 from datetime import datetime
 from pathlib import Path
 
-def get_app_dir():
-    if getattr(sys, "frozen", False):
-        # When running as .exe
-        return Path(sys.executable).parent
-
-    # When running as .py
-    return Path(__file__).parent
+from focus_core import (
+    Cooldown,
+    build_app_lookup,
+    describe_block,
+    get_app_dir,
+    get_resource_path,
+    normalize,
+    read_config_file,
+    should_kill_app,
+)
 
 APP_DIR = get_app_dir()
 CONFIG_PATH = APP_DIR / "focus_config.json"
-SETTINGS_UI_PATH = Path(__file__).with_name("settings_ui.py")
+LOG_PATH = APP_DIR / "focus.log"
 
 HOST = "127.0.0.1"
 PORT = 51372
@@ -29,42 +33,46 @@ BLOCK_ACTIVE = True
 stop_event = threading.Event()
 LAST_VALID_CONFIG = None
 settings_process = None
+tray_icon = None
+
+# one notification per app per minute is plenty
+notify_cooldown = Cooldown(seconds=60)
+
+log = logging.getLogger("fullfocus")
 
 
+def setup_logging():
+    # the .exe has no console, so everything goes to focus.log next to it
+    # max 1 MB per file, keeps 2 old ones around
+    handler = RotatingFileHandler(
+        LOG_PATH,
+        maxBytes=1_000_000,
+        backupCount=2,
+        encoding="utf-8"
+    )
+    handler.setFormatter(logging.Formatter(
+        "%(asctime)s  %(levelname)-7s  %(message)s",
+        datefmt="%Y-%m-%d %H:%M:%S"
+    ))
 
+    log.setLevel(logging.INFO)
+    log.addHandler(handler)
 
-DAYS = {
-    "mon": 0,
-    "tue": 1,
-    "wed": 2,
-    "thu": 3,
-    "fri": 4,
-    "sat": 5,
-    "sun": 6
-}
 
 def load_config():
-    """
-    Loads config from focus_config.json.
-
-    If the config is broken after the app already started,
-    it keeps using the last valid version.
-    """
+    # if the file breaks while running, keep using the last good config
     global LAST_VALID_CONFIG
 
     try:
-        with open(CONFIG_PATH, "r", encoding="utf-8") as f:
-            config = json.load(f)
-
+        config = read_config_file(CONFIG_PATH)
         LAST_VALID_CONFIG = config
         return config
 
-    except Exception as e:
-        print("Config error:", e)
-        traceback.print_exc()
+    except Exception:
+        log.exception("couldn't read %s", CONFIG_PATH)
 
         if LAST_VALID_CONFIG is not None:
-            print("Using last valid config.")
+            log.warning("using the last valid config instead")
             return LAST_VALID_CONFIG
 
         raise RuntimeError(
@@ -72,15 +80,7 @@ def load_config():
         )
 
 def get_self_command():
-    """
-    Returns the command needed to launch this same app.
-
-    In normal Python dev mode:
-        python full_focus.py
-
-    In PyInstaller .exe mode:
-        FullFocus.exe
-    """
+    # how to relaunch ourselves: the .exe, or python + this script
     if getattr(sys, "frozen", False):
         return [sys.executable]
 
@@ -90,9 +90,8 @@ def open_settings(icon=None, item=None):
     global settings_process
 
     try:
-        # If settings is already open, don't open 10 copies.
+        # don't open 10 copies of settings
         if settings_process is not None and settings_process.poll() is None:
-            print("Settings window is already open.")
             return
 
         cmd = get_self_command() + ["--settings-window"]
@@ -103,151 +102,68 @@ def open_settings(icon=None, item=None):
             creationflags=subprocess.CREATE_NEW_CONSOLE
         )
 
-        print("Opened settings.")
+    except Exception:
+        log.exception("couldn't open settings")
 
-    except Exception as e:
-        print("Failed to open settings:", e)
-        traceback.print_exc()
+def open_log(icon=None, item=None):
+    try:
+        if not LOG_PATH.exists():
+            LOG_PATH.touch()
 
-def normalize(name):
-    return name.lower().strip() if name else ""
+        os.startfile(LOG_PATH)
 
-def parse_time_to_minutes(value):
-    """
-    Converts '19:30' into minutes after midnight.
-    """
-    hour, minute = value.split(":")
-    return int(hour) * 60 + int(minute)
+    except Exception:
+        log.exception("couldn't open the log file")
 
-def get_rule_days(rule):
-    days = rule.get("days", [])
+def notify_blocked(app_name, app_config, now):
+    if tray_icon is None or not notify_cooldown.ready(normalize(app_name), now):
+        return
 
-    if not days:
-        return set(range(7))
+    try:
+        tray_icon.notify(describe_block(app_name, app_config, now), "Full Focus")
 
-    result = set()
-
-    for day in days:
-        day = day.lower()
-
-        if day in DAYS:
-            result.add(DAYS[day])
-
-    return result
-
-def is_rule_active(rule, now):
-    """
-    Returns True if the current time is inside this allowed window.
-
-    Example:
-    {
-        "days": ["tue"],
-        "start": "19:00",
-        "end": "00:00"
-    }
-
-    means Tuesday from 19:00 until midnight.
-    """
-    allowed_days = get_rule_days(rule)
-
-    start = parse_time_to_minutes(rule["start"])
-    end = parse_time_to_minutes(rule["end"])
-
-    current = now.hour * 60 + now.minute
-    today = now.weekday()
-    yesterday = (today - 1) % 7
-
-    # Full-day rule
-    # Example: 00:00 -> 00:00 means the entire selected day
-    if start == end:
-        return today in allowed_days
-
-    # Normal same-day rule
-    # Example: 09:00 -> 18:00
-    if start < end:
-        return today in allowed_days and start <= current < end
-
-    # Overnight rule
-    # Example: 22:00 -> 02:00
-    return (
-        today in allowed_days and current >= start
-    ) or (
-        yesterday in allowed_days and current < end
-    )
-
-def is_inside_allowed_window(app_config, now):
-    rules = app_config.get("rules", [])
-
-    return any(is_rule_active(rule, now) for rule in rules)
-
-
-def is_app_blocked_by_config(app_config, now):
-    if not app_config.get("enabled", True):
-        return False
-
-    mode = app_config.get("mode", "constant").lower()
-
-    if mode == "constant":
-        return True
-
-    if mode == "scheduled":
-        # Important:
-        # scheduled apps are blocked by default.
-        # rules are allowed exceptions.
-        return not is_inside_allowed_window(app_config, now)
-
-    return False
-
-def build_app_lookup(config):
-    apps = {}
-
-    for app in config.get("apps", []):
-        name = normalize(app.get("name"))
-
-        if name:
-            apps[name] = app
-
-    return apps
-
-def should_kill_app(process_name, config):
-    process_name = normalize(process_name)
-
-    if not process_name:
-        return False
-
-    app_lookup = build_app_lookup(config)
-    app_config = app_lookup.get(process_name)
-
-    if app_config is None:
-        return False
-
-    now = datetime.now()
-
-    return is_app_blocked_by_config(app_config, now)
+    except Exception:
+        # notifications are a nice-to-have, never let them break blocking
+        log.exception("couldn't show a notification")
 
 def monitor():
+    my_pid = os.getpid()
+
     while not stop_event.is_set():
         try:
             config = load_config()
-            interval = config.get("global", {}).get("check_interval_seconds", 3)
+            settings = config.get("global", {})
+            interval = settings.get("check_interval_seconds", 3)
+            notifications_on = settings.get("notifications", True)
 
             if BLOCK_ACTIVE:
+                # once per scan, not per process
+                app_lookup = build_app_lookup(config)
+                now = datetime.now()
+
                 for proc in psutil.process_iter(["name"]):
                     try:
                         process_name = proc.info["name"]
 
-                        if should_kill_app(process_name, config):
-                            print(f"Killing blocked app: {process_name}")
+                        # never kill ourselves, even if someone adds us to the list
+                        if proc.pid == my_pid:
+                            continue
+
+                        if should_kill_app(process_name, app_lookup, now):
                             proc.kill()
+                            log.info("closed %s (pid %s)", process_name, proc.pid)
+
+                            if notifications_on:
+                                app_config = app_lookup[normalize(process_name)]
+                                notify_blocked(process_name, app_config, now)
 
                     except (psutil.NoSuchProcess, psutil.AccessDenied):
                         pass
 
             stop_event.wait(interval)
 
-        except Exception as e:
-            print("Monitor error:", e)
-            traceback.print_exc()
+        except Exception:
+            log.exception("monitor loop crashed, retrying in 3s")
             stop_event.wait(3)
 
 
@@ -255,16 +171,19 @@ def toggle_blocking(icon, item):
     global BLOCK_ACTIVE
     BLOCK_ACTIVE = not BLOCK_ACTIVE
     icon.title = f"Full Focus - {'ON' if BLOCK_ACTIVE else 'OFF'}"
+    log.info("blocking turned %s", "on" if BLOCK_ACTIVE else "off")
 
 def quit_app(icon, item):
+    log.info("quit from the tray menu")
     stop_event.set()
     icon.stop()
 
 
 
 def create_tray_icon():
-    ICON_PATH = APP_DIR / "icon.ico"
-    img = Image.open(ICON_PATH)
+    global tray_icon
+
+    img = Image.open(get_resource_path("icon.ico"))
 
     menu = pystray.Menu(
         pystray.MenuItem("Settings", open_settings),
@@ -273,25 +192,21 @@ def create_tray_icon():
             toggle_blocking,
             checked=lambda item: BLOCK_ACTIVE
         ),
+        pystray.MenuItem("Open log", open_log),
         pystray.MenuItem("Quit", quit_app)
     )
 
-    icon = pystray.Icon(
+    tray_icon = pystray.Icon(
         "blocker",
         img,
         "Full Focus - ON",
         menu
     )
 
-    icon.run()
+    tray_icon.run()
 
 def send_command_to_running_instance(command):
-    """
-    Tries to contact an already-running Full Focus instance.
-
-    Returns True if another instance received the command.
-    Returns False if no instance is running.
-    """
+    # returns False if nothing is running yet
     try:
         with socket.create_connection((HOST, PORT), timeout=0.5) as sock:
             sock.sendall(command.encode("utf-8"))
@@ -302,18 +217,15 @@ def send_command_to_running_instance(command):
 
 
 def command_server():
-    """
-    Runs inside the main background app.
-    Listens for commands from future launches.
-    """
+    # listens for messages from later launches of the app
+    server = None
+
     try:
         server = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
         server.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
         server.bind((HOST, PORT))
         server.listen(5)
         server.settimeout(1)
-
-        print(f"Command server listening on {HOST}:{PORT}")
 
         while not stop_event.is_set():
             try:
@@ -323,25 +235,20 @@ def command_server():
                     command = conn.recv(1024).decode("utf-8").strip()
 
                     if command == "SHOW_SETTINGS":
-                        print("Received SHOW_SETTINGS command.")
                         open_settings()
 
             except socket.timeout:
                 continue
 
-            except Exception as e:
-                print("Command server connection error:", e)
-                traceback.print_exc()
+            except Exception:
+                log.exception("command server connection error")
 
-    except Exception as e:
-        print("Command server error:", e)
-        traceback.print_exc()
+    except Exception:
+        log.exception("command server stopped")
 
     finally:
-        try:
+        if server is not None:
             server.close()
-        except Exception:
-            pass
 
 def run_settings_window():
     from settings_ui import SettingsApp
@@ -358,18 +265,19 @@ def run_settings_window():
     root.mainloop()
 
 if __name__ == "__main__":
-    # Special mode: open only the settings window.
+    # settings window only
     if "--settings-window" in sys.argv:
         run_settings_window()
         sys.exit(0)
 
-    # Normal launch.
-    # If app is already running, tell it to show settings and exit.
+    # already running? just ask it to open settings
     if send_command_to_running_instance("SHOW_SETTINGS"):
-        print("Full Focus is already running. Opening settings window.")
         sys.exit(0)
 
-    # No running instance found, so this is the main background app.
+    # first instance, start the blocker
+    setup_logging()
+    log.info("full focus started")
+
     command_thread = threading.Thread(target=command_server, daemon=True)
     command_thread.start()
 
